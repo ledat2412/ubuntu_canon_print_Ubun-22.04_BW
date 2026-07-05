@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Canon LBP2900 Status
+Comment=Check Printer Status
+Exec=captstatusui -P LBP2900
+Icon=printer
+StartupNotify=true
+StartupWMClass=captstatusui
