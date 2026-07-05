@@ -146,6 +146,15 @@ remove_old_configuration() {
 	fi
 }
 
+purge_existing_drivers() {
+	dpkg --purge --force-all cndrvcups-capt
+	dpkg --purge --force-all cndrvcups-common
+	rm -rf /var/lib/dpkg/info/cndrvcups-capt.*
+	rm -rf /var/lib/dpkg/info/cndrvcups-common.*
+	apt-get update
+	apt-get -f install -y
+}
+
 write_ccpd_service() {
 	if [ "$INIT_SYSTEM" = 'systemd' ]; then
 		update-rc.d ccpd defaults
@@ -229,29 +238,15 @@ setup_printer() {
 	echo
 
 	remove_old_configuration
+	purge_existing_drivers
 
-	PS3='How is the printer connected to the computer: '
-	select connection in 'Via USB' 'Through network (LAN, NET)'; do
-		if [ "$REPLY" = '1' ]; then
-			printf '%s\n' 'Waiting for USB printer...'
-			mapfile -t usb_info < <(wait_for_usb_device)
-			node_device=${usb_info[0]}
-			printer_serial=${usb_info[1]}
-			path_device="/dev/canon$nameprinter"
-			break
-		elif [ "$REPLY" = '2' ]; then
-			read -p 'Enter the IP address of the printer: ' ip_address
-			until valid_ip "$ip_address"; do
-				echo 'Invalid IP address format, enter four decimal numbers'
-				echo -n 'from 0 to 255, separated by dots: '
-				read ip_address
-			done
-			path_device="net:$ip_address"
-			echo 'Turn on the printer and press any key'
-			read -s -n1
-			break
-		fi
-	done
+	# Force USB-only configuration
+	connection='Via USB'
+	printf '%s\n' 'Waiting for USB printer (USB-only mode)...'
+	mapfile -t usb_info < <(wait_for_usb_device)
+	node_device=${usb_info[0]}
+	printer_serial=${usb_info[1]}
+	path_device="/dev/canon${nameprinter}"
 
 	echo '************Driver Installation************'
 	install_drivers
