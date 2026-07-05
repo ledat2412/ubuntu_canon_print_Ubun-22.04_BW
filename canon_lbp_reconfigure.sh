@@ -1,9 +1,6 @@
 #!/bin/bash
 
-##################################################
-# Auto-detect Canon LBP printer, remove old config,
-# and install a fresh CUPS/ccpd configuration.
-##################################################
+set -u
 
 [ "$USER" != 'root' ] && exec sudo "$0" "$@"
 
@@ -80,29 +77,12 @@ check_error() {
 	fi
 }
 
-known_model_match() {
-	local detected_name=$1
-	local normalized_detected
-	local model_key
-	local normalized_model
-
-	normalized_detected=$(printf '%s' "$detected_name" | normalize_name)
-	for model_key in $NAMESPRINTERS; do
-		normalized_model=$(printf '%s' "$model_key" | normalize_name)
-		case "$normalized_detected" in
-			*"$normalized_model"*)
-				echo "$model_key"
-				return 0
-				;;
-		esac
-	done
-	echo "$detected_name"
-	return 0
-}
-
 detect_printer_model() {
 	local node_device
 	local detected_name
+	local normalized_detected
+	local model_key
+	local normalized_model
 	local raw_uri
 	local uri_model
 
@@ -110,17 +90,33 @@ detect_printer_model() {
 		[ -e "$node_device" ] || continue
 		detected_name=$(udevadm info --query=property --name="$node_device" 2> /dev/null | awk -F= '/^(ID_MODEL|ID_MODEL_FROM_DATABASE)=/{print $2; exit}')
 		if [ -n "$detected_name" ]; then
-			known_model_match "$detected_name"
-			return 0
-		fi
+			normalized_detected=$(printf '%s' "$detected_name" | normalize_name)
+			for model_key in $NAMESPRINTERS; do
+				normalized_model=$(printf '%s' "$model_key" | normalize_name)
+				case "$normalized_detected" in
+					*"$normalized_model"*)
+						echo "$model_key"
+						return 0
+						;;
+				esac
+				done
+			fi
 	done
 
 	raw_uri=$(lpinfo -v 2> /dev/null | awk '/usb:\/\/Canon\// {print $2; exit}')
 	if [ -n "$raw_uri" ]; then
 		uri_model=$(printf '%s' "$raw_uri" | sed -n 's#.*usb://Canon/\([^?]*\).*#\1#p')
 		if [ -n "$uri_model" ]; then
-			known_model_match "$uri_model"
-			return 0
+			normalized_detected=$(printf '%s' "$uri_model" | normalize_name)
+			for model_key in $NAMESPRINTERS; do
+				normalized_model=$(printf '%s' "$model_key" | normalize_name)
+				case "$normalized_detected" in
+					*"$normalized_model"*)
+						echo "$model_key"
+						return 0
+						;;
+				esac
+				done
 		fi
 	fi
 
@@ -150,235 +146,178 @@ remove_old_configuration() {
 	fi
 }
 
-install_drivers() {
-	COMMON_FILE=cndrvcups-common_${DRIVER_VERSION_COMMON}_${ARCH}.deb
-	CAPT_FILE=cndrvcups-capt_${DRIVER_VERSION}_${ARCH}.deb
-
-	if [ ! -f "$COMMON_FILE" ]; then
-		sudo -u "$LOGIN_USER" wget -O "$COMMON_FILE" "${URL_DRIVER[${ARCH}_common]}"
-		check_error WGET $? "$COMMON_FILE"
+write_ccpd_service() {
+	if [ "$INIT_SYSTEM" = 'systemd' ]; then
+		update-rc.d ccpd defaults
+	else
+		cat > /etc/init/ccpd-start.conf <<'EOF'
+description "Canon Printer Daemon for CUPS (ccpd)"
+author "LinuxMania <customer@linuxmania.jp>"
+start on (started cups and runlevel [2345])
+stop on runlevel [016]
+expect fork
+respawn
+exec /usr/sbin/ccpd start
+EOF
 	fi
-	if [ ! -f "$CAPT_FILE" ]; then
-		sudo -u "$LOGIN_USER" wget -O "$CAPT_FILE" "${URL_DRIVER[${ARCH}_capt]}"
-		check_error WGET $? "$CAPT_FILE"
+}
+
+install_drivers() {
+	local common_file
+	local capt_file
+
+	common_file=cndrvcups-common_${DRIVER_VERSION_COMMON}_${ARCH}.deb
+	capt_file=cndrvcups-capt_${DRIVER_VERSION}_${ARCH}.deb
+
+	if [ ! -f "$common_file" ]; then
+		sudo -u "$LOGIN_USER" wget -O "$common_file" "${URL_DRIVER[${ARCH}_common]}"
+		check_error WGET $? "$common_file"
+	fi
+	if [ ! -f "$capt_file" ]; then
+		sudo -u "$LOGIN_USER" wget -O "$capt_file" "${URL_DRIVER[${ARCH}_capt]}"
+		check_error WGET $? "$capt_file"
 	fi
 
 	apt-get -y update
 	apt-get -y install libglade2-0 libcanberra-gtk-module
-	configure_ccpd_service() {
-		cat > /etc/init.d/ccpd <<'EOF'
-	#!/bin/bash
-	# startup script for Canon Printer Daemon for CUPS (ccpd)
-	### BEGIN INIT INFO
-	# Provides:          ccpd
-	# Required-Start:    $local_fs $remote_fs $syslog $network $named
-	# Should-Start:      $ALL
-	# Required-Stop:     $syslog $remote_fs
-	# Default-Start:     2 3 4 5
-	# Default-Stop:      0 1 6
-	# Description:       Start Canon Printer Daemon for CUPS
-	### END INIT INFO
+	check_error PACKAGE $?
 
-	if [ `ps awx | grep cupsd | grep -v grep | wc -l` -eq 0 ]; then
-		while [ `ps awx | grep cupsd | grep -v grep | wc -l` -eq 0 ]
-		do
-			sleep 3
+	dpkg -i "$common_file"
+	check_error PACKAGE $? "$common_file"
+	dpkg -i "$capt_file"
+	check_error PACKAGE $? "$capt_file"
+}
+
+wait_for_usb_device() {
+	local node_device
+	local printer_serial
+
+	while true; do
+		node_device=$(ls -1t /dev/usb/lp* 2> /dev/null | head -1)
+		if [ -n "$node_device" ]; then
+			printer_serial=$(udevadm info --attribute-walk --name="$node_device" | sed '/./{H;$!d;};x;/ATTRS{product}=="Canon CAPT USB \(Device\|Printer\)"/!d;' | awk -F'==' '/ATTRS{serial}/{print $2}')
+			if [ -n "$printer_serial" ]; then
+				printf '%s\n%s\n' "$node_device" "$printer_serial"
+				return 0
+			fi
+		fi
+		echo -ne "Turn on the printer and plug in USB cable\r"
+		sleep 2
+	done
+}
+
+setup_printer() {
+	local nameprinter
+	local connection
+	local path_device
+	local ip_address
+	local node_device
+	local printer_serial
+	local installed_printer
+
+	echo
+	nameprinter=$(detect_printer_model)
+	if [ -n "$nameprinter" ]; then
+		echo "Detected printer: $nameprinter"
+	else
+		PS3='Please choose your printer: '
+		select nameprinter in $NAMESPRINTERS; do
+			[ -n "$nameprinter" ] && break
 		done
-		sleep 5
+		echo "Selected printer: $nameprinter"
+	fi
+	echo
+
+	remove_old_configuration
+
+	PS3='How is the printer connected to the computer: '
+	select connection in 'Via USB' 'Through network (LAN, NET)'; do
+		if [ "$REPLY" = '1' ]; then
+			printf '%s\n' 'Waiting for USB printer...'
+			mapfile -t usb_info < <(wait_for_usb_device)
+			node_device=${usb_info[0]}
+			printer_serial=${usb_info[1]}
+			path_device="/dev/canon$nameprinter"
+			break
+		elif [ "$REPLY" = '2' ]; then
+			read -p 'Enter the IP address of the printer: ' ip_address
+			until valid_ip "$ip_address"; do
+				echo 'Invalid IP address format, enter four decimal numbers'
+				echo -n 'from 0 to 255, separated by dots: '
+				read ip_address
+			done
+			path_device="net:$ip_address"
+			echo 'Turn on the printer and press any key'
+			read -s -n1
+			break
+		fi
+	done
+
+	echo '************Driver Installation************'
+	install_drivers
+	write_ccpd_service
+
+	if [ "$ARCH" = 'amd64' ]; then
+		echo 'Installing 32-bit libraries required to run 64-bit printer driver'
+		apt-get -y install libatk1.0-0:i386 libcairo2:i386 libgtk2.0-0:i386 libpango1.0-0:i386 libstdc++6:i386 libpopt0:i386 libxml2:i386 libc6:i386
+		check_error PACKAGE $?
 	fi
 
-	ccpd_start ()
-	{
-		echo -n "Starting ${DAEMON}: "
-		start-stop-daemon --start --quiet --oknodo --exec ${DAEMON}
-	}
+	echo 'Installing the printer in CUPS'
+	/usr/sbin/lpadmin -p "$nameprinter" -P "/usr/share/cups/model/CNCUPSLBP${LASERSHOT[$nameprinter]}CAPTK.ppd" -v ccp://localhost:59687 -E
+	echo "Setting $nameprinter as the default printer"
+	/usr/sbin/lpadmin -d "$nameprinter"
+	echo 'Registering the printer in the ccpd daemon configuration file'
+	/usr/sbin/ccpdadmin -p "$nameprinter" -o "$path_device"
 
-	ccpd_stop ()
-	{
-		echo -n "Shutting down ${DAEMON}: "
-		start-stop-daemon --stop --quiet --oknodo --retry TERM/30/KILL/5 --exec ${DAEMON}
-	}
-
-	DAEMON=/usr/sbin/ccpd
-	case $1 in
-		start)
-			ccpd_start
-			;;
-		stop)
-			ccpd_stop
-			;;
-		status)
-			echo "${DAEMON}:" $(pidof ${DAEMON})
-			;;
-		restart)
-			while true
-			do
-				ccpd_stop
-				ccpd_start
-				for (( i = 1 ; i <= 5 ; i++ ))
-				do
-					sleep 1
-					set -- $(pidof ${DAEMON})
-					[ -n "$1" -a -n "$2" ] && exit 0
-				done
+	installed_printer=$(ccpdadmin 2> /dev/null | grep "$nameprinter" | awk '{print $3}')
+	if [ -n "$installed_printer" ]; then
+		if [ "$connection" = 'Via USB' ]; then
+			echo 'Creating a rule for the printer'
+			echo 'KERNEL=="lp[0-9]*", SUBSYSTEMS=="usb", ATTRS{serial}=='"$printer_serial"', SYMLINK+="canon'"$nameprinter"'"' > /etc/udev/rules.d/85-canon-capt.rules
+			udevadm control --reload-rules
+			until [ -e "$path_device" ]; do
+				echo -ne "Turn off the printer, wait 2 seconds, then turn on the printer\r"
+				sleep 2
 			done
-			;;
-		*)
-			echo "Usage: ccpd {start|stop|status|restart}"
-			exit 1
-			;;
-	esac
-	exit 0
-	EOF
-	}
-
-	configure_usb_rule() {
-		local printer_name=$1
-		local printer_serial=$2
-
-		echo 'Creating a rule for the printer'
-		echo 'KERNEL=="lp[0-9]*", SUBSYSTEMS=="usb", ATTRS{serial}=='"$printer_serial"', SYMLINK+="canon'"$printer_name"'"' > /etc/udev/rules.d/85-canon-capt.rules
-		udevadm control --reload-rules
-	}
-
-	reconfigure_printer() {
-		local nameprinter
-		local connection
-		local path_device
-		local ip_address
-		local node_device
-		local printer_serial
-		local installed_printer
-
-		echo
-		nameprinter=$(detect_printer_model)
-		if [ -n "$nameprinter" ]; then
-			echo "Detected printer: $nameprinter"
-		else
-			PS3='Please choose your printer: '
-			select nameprinter in $NAMESPRINTERS
-			do
-				[ -n "$nameprinter" ] && break
-			done
-			echo "Selected printer: $nameprinter"
-		fi
-		echo
-
-		remove_old_configuration
-
-		PS3='How is the printer connected to the computer: '
-		select connection in 'Via USB' 'Through network (LAN, NET)'
-		do
-			if [ "$REPLY" = '1' ]; then
-				while true
-				do
-					node_device=$(ls -1t /dev/usb/lp* 2> /dev/null | head -1)
-					if [ -n "$node_device" ]; then
-						printer_serial=$(udevadm info --attribute-walk --name="$node_device" | sed '/./{H;$!d;};x;/ATTRS{product}=="Canon CAPT USB \(Device\|Printer\)"/!d;' | awk -F'==' '/ATTRS{serial}/{print $2}')
-						[ -n "$printer_serial" ] && break
-					fi
-					echo -ne "Turn on the printer and plug in USB cable\r"
-					sleep 2
-				done
-				path_device="/dev/canon$nameprinter"
-				break
-			elif [ "$REPLY" = '2' ]; then
-				read -p 'Enter the IP address of the printer: ' ip_address
-				until valid_ip "$ip_address"
-				do
-					echo 'Invalid IP address format, enter four decimal numbers'
-					echo -n 'from 0 to 255, separated by dots: '
-					read ip_address
-				done
-				path_device="net:$ip_address"
-				echo 'Turn on the printer and press any key'
-				read -s -n1
-				sleep 5
-				break
-			fi
-		done
-
-		echo '************Driver Installation************'
-		install_drivers
-		configure_ccpd_service
-
-		if [ "$ARCH" = 'amd64' ]; then
-			echo 'Installing 32-bit libraries required to run 64-bit printer driver'
-			apt-get -y install libatk1.0-0:i386 libcairo2:i386 libgtk2.0-0:i386 libpango1.0-0:i386 libstdc++6:i386 libpopt0:i386 libxml2:i386 libc6:i386
-			check_error PACKAGE $?
 		fi
 
-		echo 'Installing the printer in CUPS'
-		/usr/sbin/lpadmin -p "$nameprinter" -P "/usr/share/cups/model/CNCUPSLBP${LASERSHOT[$nameprinter]}CAPTK.ppd" -v ccp://localhost:59687 -E
-		echo "Setting $nameprinter as the default printer"
-		/usr/sbin/lpadmin -d "$nameprinter"
-		echo 'Registering the printer in the ccpd daemon configuration file'
-		/usr/sbin/ccpdadmin -p "$nameprinter" -o "$path_device"
+		echo -e "\e[2KRunning ccpd"
+		service ccpd restart
 
-		installed_printer=$(ccpdadmin 2> /dev/null | grep "$nameprinter" | awk '{print $3}')
-		if [ -n "$installed_printer" ]; then
-			if [ "$connection" = 'Via USB' ]; then
-				configure_usb_rule "$nameprinter" "$printer_serial"
-				until [ -e "$path_device" ]
-				do
-					echo -ne "Turn off the printer, wait 2 seconds, then turn on the printer\r"
-					sleep 2
-				done
-			fi
-			echo -e "\e[2KRunning ccpd"
-			service ccpd restart
-			if [ "$INIT_SYSTEM" = 'systemd' ]; then
-				update-rc.d ccpd defaults
-			else
-				cat > /etc/init/ccpd-start.conf <<'EOF'
-	description "Canon Printer Daemon for CUPS (ccpd)"
-	author "LinuxMania <customer@linuxmania.jp>"
-	start on (started cups and runlevel [2345])
-	stop on runlevel [016]
-	expect fork
-	respawn
-	exec /usr/sbin/ccpd start
-	EOF
-			fi
-			cat > "${XDG_DESKTOP_DIR}/${nameprinter}.desktop" <<EOF
-	#!/usr/bin/env xdg-open
-	[Desktop Entry]
-	Version=1.0
-	Name=${nameprinter}
-	GenericName=Status monitor for Canon CAPT Printer
-	Exec=captstatusui -P ${nameprinter}
-	Terminal=false
-	Type=Application
-	Icon=/usr/share/icons/Humanity/devices/48/printer.svg
-	EOF
-			chmod 775 "${XDG_DESKTOP_DIR}/${nameprinter}.desktop"
-			chown "$LOGIN_USER:$LOGIN_USER" "${XDG_DESKTOP_DIR}/${nameprinter}.desktop"
-			if [[ -n "$DISPLAY" ]]; then
-				sudo -u "$LOGIN_USER" nohup captstatusui -P "$nameprinter" > /dev/null 2>&1 &
-				sleep 5
-			fi
-			echo 'Reconfiguration completed. Press any key to exit'
-			read -s -n1
-			exit 0
-		else
-			echo "Driver for $nameprinter is not installed!"
-			echo 'Press any key to exit'
-			read -s -n1
-			exit 1
+		cat > "${XDG_DESKTOP_DIR}/${nameprinter}.desktop" <<EOF
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Version=1.0
+Name=${nameprinter}
+GenericName=Status monitor for Canon CAPT Printer
+Exec=captstatusui -P ${nameprinter}
+Terminal=false
+Type=Application
+Icon=/usr/share/icons/Humanity/devices/48/printer.svg
+EOF
+		chmod 775 "${XDG_DESKTOP_DIR}/${nameprinter}.desktop"
+		chown "$LOGIN_USER:$LOGIN_USER" "${XDG_DESKTOP_DIR}/${nameprinter}.desktop"
+
+		if [[ -n "$DISPLAY" ]]; then
+			sudo -u "$LOGIN_USER" nohup captstatusui -P "$nameprinter" > /dev/null 2>&1 &
+			sleep 5
 		fi
-	}
 
-	clear
-	echo 'Canon CAPT printer reconfigure tool for Ubuntu'
-	echo 'This script detects a printer name, removes the old configuration, and installs a fresh one.'
+		echo 'Reconfiguration completed. Press any key to exit'
+		read -s -n1
+		exit 0
+	else
+		echo "Driver for $nameprinter is not installed!"
+		echo 'Press any key to exit'
+		read -s -n1
+		exit 1
+	fi
+}
 
-	reconfigure_printer
-+		exit 1
-+	fi
-+}
-+
-+clear
-+echo 'Canon CAPT printer reconfigure tool for Ubuntu'
-+echo 'This script detects a printer name, removes the old configuration, and installs a fresh one.'
-+
-+reconfigure_printer
+clear
+
+echo 'Canon CAPT printer reconfigure tool for Ubuntu'
+echo 'This script detects a printer name, removes the old configuration, and installs a fresh one.'
+
+setup_printer
